@@ -406,12 +406,24 @@ def _polygon_area(points):
     return abs(a) / 2.0
 
 
-def load_dxf_piece(path, arc_segments=16, spline_samples=40, join_tolerance=0.01):
+def load_dxf_piece(path, arc_segments=16, spline_samples=40, join_tolerance=0.01,
+                    gap_tolerance=3.0):
     """Carga un DXF y devuelve (outer, holes): el contorno principal como
     lista de puntos (x,y) cerrada, y una lista de contornos interiores
     (agujeros). Reconstruye automaticamente piezas cuyo contorno viene
     partido en varias entidades sueltas (LINE/SPLINE/ARC) uniendolas por
-    sus extremos."""
+    sus extremos.
+
+    Se hace en dos pasadas: primero con una tolerancia bien chica
+    (`join_tolerance`, para continuaciones exactas de una polilinea), y
+    despues con una tolerancia mas amplia (`gap_tolerance`) para cerrar
+    "alivios" de plegado tipicos de chapa (micro-cortes de 1-2mm en las
+    esquinas para permitir el doblez) que de otra forma dejarian el
+    contorno incompleto -- y por lo tanto la pieza mas chica de lo real,
+    lo cual es peligroso para el nesting (otra pieza podria terminar
+    ubicada donde en realidad hay material). Lineas realmente sueltas
+    (por ejemplo lineas de doblez/plegado a varios mm de distancia, que
+    no son de corte) siguen quedando afuera y se avisan."""
     pairs = _read_group_codes(path)
     entities = _iter_entities(pairs)
     entities = _entities_with_vertex_groups(entities)
@@ -445,6 +457,10 @@ def load_dxf_piece(path, arc_segments=16, spline_samples=40, join_tolerance=0.01
     closed_loops.extend(joined_loops)
 
     closed_loops = [l for l in closed_loops if len(l) >= 3]
+    # Descartar contornos "cerrados" de area practicamente nula: suelen ser
+    # lineas de doblez/plegado dibujadas como una curva de ida y vuelta
+    # (no encierran ninguna superficie real, asi que no son agujeros).
+    closed_loops = [l for l in closed_loops if _polygon_area(l) > 1.0]
 
     if not closed_loops:
         raise ValueError(
@@ -459,8 +475,10 @@ def load_dxf_piece(path, arc_segments=16, spline_samples=40, join_tolerance=0.01
     warning = None
     if leftover:
         warning = (
-            "%d tramo(s) sueltos no pudieron unirse a un contorno cerrado "
-            "(posible micro-hueco entre segmentos); se ignoraron." % len(leftover)
+            "%d tramo(s) sueltos no forman un contorno cerrado y se "
+            "ignoraron (suelen ser lineas de doblez/plegado o alivios de "
+            "esquina, no afectan el corte; si esperabas una figura cerrada "
+            "ahi, revisa el DXF)." % len(leftover)
         )
     return outer, holes, warning
 
