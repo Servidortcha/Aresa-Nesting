@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>Optimización de cortes láser (nesting)</title>
+<style>
+  :root { --accent:#2563eb; --bg:#0f172a; --panel:#1e293b; --text:#e2e8f0; --muted:#94a3b8; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; background:#f4f6f8; color:#1e293b; margin:0; padding:24px; }
+  h1 { font-size:1.4rem; margin-bottom:4px; }
+  .sub { color:#64748b; margin-top:0; margin-bottom:20px; }
+  .layout { display:flex; gap:24px; align-items:flex-start; flex-wrap:wrap; }
+  .panel { background:#fff; border-radius:12px; padding:20px; box-shadow:0 1px 3px rgba(0,0,0,.08); }
+  .panel-form { width:360px; flex-shrink:0; }
+  .panel-results { flex:1; min-width:400px; }
+  label { display:block; font-size:.85rem; font-weight:600; margin:14px 0 4px; }
+  input[type=number], select { width:100%; padding:8px 10px; border:1px solid #cbd5e1; border-radius:8px; font-size:.9rem; }
+  input[type=checkbox] { margin-right:6px; }
+  .row2 { display:flex; gap:10px; }
+  .row2 > div { flex:1; }
+  #drop { border:2px dashed #cbd5e1; border-radius:10px; padding:20px; text-align:center; color:#64748b; cursor:pointer; margin-top:14px; }
+  #drop.drag { border-color:var(--accent); background:#eff6ff; }
+  #fileList { margin-top:12px; font-size:.85rem; }
+  .file-item { display:flex; align-items:center; gap:8px; padding:6px 0; border-bottom:1px solid #f1f5f9; }
+  .file-item span.name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .file-item input { width:60px !important; }
+  button#run { margin-top:18px; width:100%; background:var(--accent); color:#fff; border:none; padding:12px; border-radius:8px; font-size:.95rem; font-weight:600; cursor:pointer; }
+  button#run:disabled { opacity:.5; cursor:not-allowed; }
+  .sheet-card { margin-bottom:22px; }
+  .sheet-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; }
+  .badge { background:#dcfce7; color:#166534; padding:2px 10px; border-radius:999px; font-size:.8rem; font-weight:600; }
+  canvas { border:1px solid #e2e8f0; border-radius:8px; background:#fafafa; max-width:100%; }
+  .dl { font-size:.85rem; color:var(--accent); text-decoration:none; margin-left:10px; }
+  #status { margin-top:12px; font-size:.85rem; color:#64748b; }
+  .warn { color:#b45309; }
+  .err { color:#b91c1c; }
+  .empty { color:#94a3b8; font-style:italic; }
+</style>
+</head>
+<body>
+  <h1>Optimización de cortes (nesting) para láser</h1>
+  <p class="sub">Subí uno o más archivos .dxf (una pieza por archivo), indicá cuántas copias de cada una necesitás, y generá el layout optimizado sobre la chapa.</p>
+
+  <div class="layout">
+    <div class="panel panel-form">
+      <label>Ancho de chapa (mm)</label>
+      <input type="number" id="sheetW" value="1200" min="1">
+      <label>Largo máximo de chapa (mm) <span style="font-weight:400;color:#94a3b8;">— dejar vacío para calcular el mínimo necesario</span></label>
+      <input type="number" id="sheetH" placeholder="Automático" min="1">
+      <label>Espaciado entre piezas / kerf (mm)</label>
+      <input type="number" id="spacing" value="3" min="0" step="0.1">
+
+      <label><input type="checkbox" id="allowRot" checked> Permitir rotación (el ángulo de cada pieza se calcula automáticamente para ocupar el mínimo espacio)</label>
+
+      <p id="advToggle" style="font-size:.8rem;color:var(--accent);cursor:pointer;margin:10px 0 0;">Opciones avanzadas ▾</p>
+      <div class="row2" id="rotStepWrap" style="display:none;">
+        <div>
+          <label>Paso de rotación (°) <span style="font-weight:400;color:#94a3b8;">vacío = auto</span></label>
+          <input type="number" id="rotStep" placeholder="Automático" min="1" max="90">
+        </div>
+        <div>
+          <label>Resolución de grilla (mm/celda) <span style="font-weight:400;color:#94a3b8;">vacío = auto</span></label>
+          <input type="number" id="cellMm" placeholder="Automático" min="0.5" step="0.5">
+        </div>
+      </div>
+
+      <div id="drop">Arrastrá acá tus archivos .dxf<br>o hacé clic para elegirlos</div>
+      <input type="file" id="fileInput" accept=".dxf" multiple style="display:none">
+      <div id="fileList"></div>
+
+      <button id="run" disabled>Optimizar layout</button>
+      <div id="status"></div>
+    </div>
+
+    <div class="panel panel-results" id="results">
+      <p class="empty">Los resultados van a aparecer acá.</p>
+    </div>
+  </div>
+
+<script>
+document.getElementById('advToggle').addEventListener('click', () => {
+  const w = document.getElementById('rotStepWrap');
+  w.style.display = w.style.display === 'none' ? 'flex' : 'none';
+});
+const drop = document.getElementById('drop');
+const fileInput = document.getElementById('fileInput');
+const fileListEl = document.getElementById('fileList');
+const runBtn = document.getElementById('run');
+const statusEl = document.getElementById('status');
+const resultsEl = document.getElementById('results');
+const allowRot = document.getElementById('allowRot');
+
+let files = []; // {file, qty}
+
+drop.addEventListener('click', () => fileInput.click());
+drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('drag'); });
+drop.addEventListener('dragleave', () => drop.classList.remove('drag'));
+drop.addEventListener('drop', e => {
+  e.preventDefault(); drop.classList.remove('drag');
+  addFiles(e.dataTransfer.files);
+});
+fileInput.addEventListener('change', () => addFiles(fileInput.files));
+
+function addFiles(fileListObj) {
+  for (const f of fileListObj) {
+    if (!f.name.toLowerCase().endsWith('.dxf')) continue;
+    if (files.some(x => x.file.name === f.name)) continue;
+    files.push({ file: f, qty: 1 });
+  }
+  renderFileList();
+}
+
+function renderFileList() {
+  fileListEl.innerHTML = '';
+  files.forEach((entry, idx) => {
+    const div = document.createElement('div');
+    div.className = 'file-item';
+    div.innerHTML = `<span class="name">${entry.file.name}</span>
+      <input type="number" min="1" value="${entry.qty}" data-idx="${idx}">
+      <button data-remove="${idx}" style="background:none;border:none;color:#b91c1c;cursor:pointer;">✕</button>`;
+    fileListEl.appendChild(div);
+  });
+  fileListEl.querySelectorAll('input').forEach(inp => {
+    inp.addEventListener('change', e => {
+      files[+e.target.dataset.idx].qty = Math.max(1, parseInt(e.target.value) || 1);
+    });
+  });
+  fileListEl.querySelectorAll('button[data-remove]').forEach(btn => {
+    btn.addEventListener('click', e => {
+      files.splice(+e.target.dataset.remove, 1);
+      renderFileList();
+    });
+  });
+  runBtn.disabled = files.length === 0;
+}
+
+allowRot.addEventListener('change', () => {
+  document.getElementById('rotStepWrap').style.opacity = allowRot.checked ? 1 : 0.4;
+});
+
+runBtn.addEventListener('click', async () => {
+  runBtn.disabled = true;
+  statusEl.textContent = 'Procesando... esto puede tardar según la cantidad de piezas.';
+  statusEl.className = '';
+  resultsEl.innerHTML = '';
+
+  const fd = new FormData();
+  fd.append('sheet_w', document.getElementById('sheetW').value);
+  fd.append('sheet_h', document.getElementById('sheetH').value);
+  fd.append('spacing', document.getElementById('spacing').value);
+  fd.append('allow_rotation', allowRot.checked ? '1' : '0');
+  fd.append('rotation_step', document.getElementById('rotStep').value);
+  fd.append('cell_mm', document.getElementById('cellMm').value);
+
+  const qtyMap = {};
+  files.forEach(f => { qtyMap[f.file.name] = f.qty; fd.append('dxf_files', f.file); });
+  fd.append('quantities', JSON.stringify(qtyMap));
+
+  try {
+    const res = await fetch('/optimize', { method: 'POST', body: fd });
+    const data = await res.json();
+    if (!res.ok) {
+      statusEl.textContent = data.error || 'Error desconocido.';
+      statusEl.className = 'err';
+      runBtn.disabled = false;
+      return;
+    }
+    renderResults(data);
+    statusEl.textContent = data.warnings && data.warnings.length ? data.warnings.join(' ') : '';
+    statusEl.className = 'warn';
+  } catch (err) {
+    statusEl.textContent = 'Error de conexión: ' + err;
+    statusEl.className = 'err';
+  }
+  runBtn.disabled = false;
+});
+
+function renderResults(data) {
+  resultsEl.innerHTML = '';
+  if (data.sheets.length === 0) {
+    resultsEl.innerHTML = '<p class="empty">Ninguna pieza pudo ubicarse.</p>';
+  }
+  data.sheets.forEach(sheet => {
+    const card = document.createElement('div');
+    card.className = 'sheet-card';
+    card.innerHTML = `
+      <div class="sheet-head">
+        <strong>Chapa ${sheet.index}</strong> (${sheet.width} x ${sheet.height} mm)
+        <span class="badge">${sheet.utilization_pct}% aprovechamiento</span>
+        <a class="dl" href="/download/${data.job_id}/${sheet.file}">Descargar DXF</a>
+      </div>
+    `;
+    const canvas = document.createElement('canvas');
+    const scale = Math.min(700 / sheet.width, 500 / sheet.height);
+    canvas.width = sheet.width * scale;
+    canvas.height = sheet.height * scale;
+    card.appendChild(canvas);
+    resultsEl.appendChild(card);
+    drawSheet(canvas, sheet, scale);
+  });
+
+  if (data.sheets.length > 1) {
+    const allLink = document.createElement('a');
+    allLink.href = `/download/${data.job_id}/all`;
+    allLink.className = 'dl';
+    allLink.textContent = 'Descargar todas las chapas (.zip)';
+    resultsEl.appendChild(allLink);
+  }
+
+  if (data.unplaced && data.unplaced.length) {
+    const p = document.createElement('p');
+    p.className = 'err';
+    p.textContent = 'No se pudieron ubicar (más grandes que la chapa o sin espacio): ' +
+      data.unplaced.map(u => u.name).join(', ');
+    resultsEl.appendChild(p);
+  }
+}
+
+function drawSheet(canvas, sheet, scale) {
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#fafafa';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.strokeStyle = '#94a3b8';
+  ctx.strokeRect(0, 0, canvas.width, canvas.height);
+
+  const colors = ['#2563eb','#059669','#d97706','#dc2626','#7c3aed','#0891b2','#be185d','#65a30d'];
+  const nameColor = {};
+  let ci = 0;
+
+  sheet.pieces.forEach(p => {
+    if (!(p.name in nameColor)) { nameColor[p.name] = colors[ci % colors.length]; ci++; }
+    ctx.beginPath();
+    p.points.forEach((pt, i) => {
+      const x = pt[0] * scale;
+      const y = canvas.height - pt[1] * scale; // invertir Y (DXF Y-up, canvas Y-down)
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.closePath();
+    ctx.fillStyle = nameColor[p.name] + '33';
+    ctx.strokeStyle = nameColor[p.name];
+    ctx.lineWidth = 1;
+    ctx.fill();
+    ctx.stroke();
+    (p.holes || []).forEach(hole => {
+      ctx.beginPath();
+      hole.forEach((pt, i) => {
+        const x = pt[0] * scale;
+        const y = canvas.height - pt[1] * scale;
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      });
+      ctx.closePath();
+      ctx.fillStyle = '#fafafa';
+      ctx.fill();
+      ctx.stroke();
+    });
+  });
+}
+</script>
+</body>
+</html>
