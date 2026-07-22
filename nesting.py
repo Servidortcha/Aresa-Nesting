@@ -139,6 +139,18 @@ def nest_strip(parts, sheet_w_mm, spacing_mm=3.0, cell_mm=None,
     if max_length_mm:
         guess_h = min(guess_h, max_length_mm)
 
+    # Limite de memoria: una grilla demasiado fina sobre una chapa grande
+    # puede consumir mucha RAM (cada busqueda de posicion hace una
+    # convolucion FFT del tamano de la chapa). Si la estimacion de largo
+    # es grande, usamos una resolucion mas gruesa para que el numero total
+    # de celdas se mantenga acotado, aunque eso implique perder algo de
+    # precision en el acomodo.
+    MAX_GRID_CELLS = 1_500_000
+    estimated_h_for_sizing = max_length_mm or (guess_h * 3.0)
+    min_cell_for_memory = math.sqrt((sheet_w_mm * estimated_h_for_sizing) / MAX_GRID_CELLS)
+    if min_cell_for_memory > cell_mm:
+        cell_mm = round(min_cell_for_memory, 2)
+
     sheets, unplaced = [], []
     attempts = 0
     variants_cache = {}
